@@ -23,7 +23,19 @@ android {
     kotlinOptions { jvmTarget = "17" }
 }
 
+android {
+    buildFeatures { compose = true }
+    composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+}
+
 dependencies {
+    // Compose YALNIZCA hazır ConsentSheet için gerekli ve compileOnly:
+    // kendi rıza ekranını çizen uygulama Compose'u bağımlılık olarak almasın.
+    compileOnly(platform("androidx.compose:compose-bom:2024.06.00"))
+    compileOnly("androidx.compose.material3:material3")
+    compileOnly("androidx.compose.ui:ui")
+    compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
     // Sıfır üçüncü parti runtime bağımlılığı: rıza SDK'sı uygulamanın
     // bağımlılık ağacını kirletmemeli. org.json Android'de yerleşiktir.
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
