@@ -95,6 +95,39 @@ internal object ConsentJson {
     }.getOrDefault(emptyList())
 }
 
+/**
+ * `SharedPreferences` tabanlı varsayılan kalıcı depo.
+ *
+ * Rıza kaydı bir sır değil, kullanıcının kendi kararıdır. Cihaz sırrını daha
+ * sıkı saklamak isteyen uygulama aynı arayüzü EncryptedSharedPreferences ile
+ * uygular — `SharedPreferences` arayüzü aynıdır, ikinci yapıcıyla verilebilir.
+ */
+class SharedPreferencesConsentStorage(
+    private val prefs: android.content.SharedPreferences,
+) : ConsentStorage {
+    constructor(context: android.content.Context) :
+        this(context.applicationContext.getSharedPreferences(FILE, android.content.Context.MODE_PRIVATE))
+
+    private companion object {
+        const val FILE = "com.veribenim.consent"
+        const val RECORD = "record"
+        const val SESSION = "session"
+        const val QUEUE = "queue"
+    }
+
+    override fun loadRecord() = prefs.getString(RECORD, null)?.let(ConsentJson::recordFromJson)
+    override fun saveRecord(record: ConsentRecord) { prefs.edit().putString(RECORD, ConsentJson.recordToJson(record)).apply() }
+    override fun clearRecord() { prefs.edit().remove(RECORD).apply() }
+
+    override fun loadSession() = prefs.getString(SESSION, null)?.let(ConsentJson::sessionFromJson)
+    override fun saveSession(session: DeviceSession) { prefs.edit().putString(SESSION, ConsentJson.sessionToJson(session)).apply() }
+    override fun clearSession() { prefs.edit().remove(SESSION).apply() }
+
+    override fun loadQueue() = prefs.getString(QUEUE, null)?.let(ConsentJson::queueFromJson) ?: emptyList()
+    // commit(): kuyruk rıza ispatıdır; süreç hemen ölürse apply() yazmadan kaybolabilir.
+    override fun saveQueue(queue: List<QueuedConsent>) { prefs.edit().putString(QUEUE, ConsentJson.queueToJson(queue)).commit() }
+}
+
 /** Bellekte tutan depo — testler ve önizleme için. */
 class InMemoryConsentStorage : ConsentStorage {
     private var record: ConsentRecord? = null

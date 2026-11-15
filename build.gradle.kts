@@ -1,7 +1,15 @@
 plugins {
     id("com.android.library") version "8.5.0"
     kotlin("android") version "2.0.0"
+    // Kotlin 2.0'dan itibaren Compose derleyicisi ayrı eklentidir;
+    // `composeOptions.kotlinCompilerExtensionVersion` artık kullanılmaz ve
+    // eklenti olmadan `compose = true` derlemeyi durdurur.
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.0"
+    `maven-publish`
 }
+
+group = "com.veribenim"
+version = "1.0.0" // Veribenim.SDK_VERSION ile aynı tutun.
 
 android {
     namespace = "com.veribenim.consent"
@@ -25,7 +33,38 @@ android {
 
 android {
     buildFeatures { compose = true }
-    composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+
+    publishing {
+        singleVariant("release") {
+            withSourcesJar()
+        }
+    }
+}
+
+// JitPack ya da Maven Central için yayın tanımı. Maven Central ayrıca imzalama
+// ve POM'da geliştirici/SCM bilgisi ister; bkz. README → "Yayın".
+publishing {
+    publications {
+        register<MavenPublication>("release") {
+            groupId = "com.veribenim"
+            artifactId = "consent"
+            version = project.version.toString()
+            afterEvaluate { from(components["release"]) }
+
+            pom {
+                name.set("Veribenim Android")
+                description.set("KVKK & GDPR rıza yönetimi — native Android SDK")
+                url.set("https://github.com/Pariette-Inc/veribenim.kotlin.sdk")
+                licenses {
+                    license {
+                        name.set("MIT")
+                        url.set("https://opensource.org/licenses/MIT")
+                    }
+                }
+                scm { url.set("https://github.com/Pariette-Inc/veribenim.kotlin.sdk") }
+            }
+        }
+    }
 }
 
 dependencies {
@@ -40,7 +79,8 @@ dependencies {
     // bağımlılık ağacını kirletmemeli. org.json Android'de yerleşiktir.
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 
-    testImplementation(kotlin("test"))
+    // kotlin-test + JUnit4 çalıştırıcısı (Android birim testleri JUnit4 ile koşar).
+    testImplementation(kotlin("test-junit"))
     // org.json birim testlerde yerleşik gelmez — JVM karşılığı eklenir.
     testImplementation("org.json:json:20240303")
 }

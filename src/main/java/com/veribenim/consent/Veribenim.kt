@@ -9,12 +9,37 @@ data class VeribenimConfig(
     /** Package name — konsolda kayıtlı `app_identifier` ile birebir aynı olmalı. */
     val appIdentifier: String,
     val platform: String = "android",
-    val baseUrl: String = "https://live.veribenim.com",
+    /** Bugünkü üretim adresi; staging ya da kendi proxy'niz için değiştirin. */
+    val baseUrl: String = DEFAULT_BASE_URL,
     /** Rıza kaç gün sonra yeniden sorulsun. Beyan sürümü değişirse zaten sorulur. */
     val reconsentDays: Int = 365,
+    /** El sıkışmada gönderilir (ör. BuildConfig.VERSION_NAME). Sunucu en çok 32 karakter kabul eder. */
     val appVersion: String? = null,
+    /** El sıkışmada gönderilir (ör. Build.VERSION.RELEASE). */
     val osVersion: String? = null,
-)
+    /** Rıza kaydının `user_agent` alanı; null ise [defaultUserAgent]. Sunucu boş değeri bot sayar. */
+    val userAgent: String? = null,
+) {
+    companion object {
+        const val DEFAULT_BASE_URL = "https://live.veribenim.com"
+
+        /**
+         * Dört mobil SDK'da aynı biçim: `VeribenimSDK/<sürüm> (<platform>[ <os>]; <dil>)`.
+         * Sunucudaki `BotDetector` kalıplarından (`okhttp`, `java/`, `bot/` …)
+         * hiçbirini içermemeli — aksi hâlde her mobil rıza bot sayılır.
+         */
+        fun defaultUserAgent(platform: String, osVersion: String? = null): String {
+            val os = if (osVersion != null) "$platform $osVersion" else platform
+            return "VeribenimSDK/${Veribenim.SDK_VERSION} ($os; kotlin)"
+        }
+    }
+
+    internal val resolvedUserAgent: String
+        get() = userAgent ?: defaultUserAgent(platform, osVersion)
+
+    internal val apiBase: String
+        get() = baseUrl.trimEnd('/')
+}
 
 /** Ağ katmanı soyutlaması — testler gerçek HTTP yerine sahte taşıyıcı verir. */
 interface Transport {
@@ -70,10 +95,24 @@ class Veribenim(
     private val transport: Transport = DefaultTransport(),
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
-    private var session: DeviceSession? = storage.loadSession()
-    private var record: ConsentRecord? = storage.loadRecord()
+    companion object {
+        /** Paket sürümü — `user_agent` alanına girer. Etiketle birlikte güncelleyin. */
+        const val SDK_VERSION = "1.0.0"
+
+        /** Sunucu `app_version` / `os_version` için `max:32` doğrular. */
+        internal const val VERSION_MAX_LENGTH = 32
+    }
+
+    @Volatile private var session: DeviceSession? = storage.loadSession()
+    @Volatile private var record: ConsentRecord? = storage.loadRecord()
     private var latestVersion: String? = null
-    private val observers = mutableListOf<(ConsentPreferences) -> Unit>()
+    private val observers = java.util.concurrent.CopyOnWriteArrayList<(ConsentPreferences) -> Unit>()
+
+    /** Aynı anda tek kuyruk boşaltma: iki eşzamanlı tur aynı kaydı iki kez gönderirdi. */
+    private val flushLock = Any()
+
+    /** Kuyruk okuma-yazma kilidi; ağ beklenirken TUTULMAZ. */
+    private val queueLock = Any()
 
     // ── Durum sorgulama ──────────────────────────────────────────────────────
 
@@ -134,7 +173,9 @@ class Veribenim(
         storage.saveRecord(entry)
         observers.forEach { it(preferences) }
 
-        storage.saveQueue(storage.loadQueue() + QueuedConsent(action, preferences, sessionId, now))
+        synchronized(queueLock) {
+            storage.saveQueue(storage.loadQueue() + QueuedConsent(action, preferences, sessionId, now))
+        }
 
         runCatching { flush() }
     }
@@ -147,12 +188,12 @@ class Veribenim(
         val body = JSONObject().apply {
             put("app_identifier", config.appIdentifier)
             put("platform", config.platform)
-            config.appVersion?.let { put("app_version", it) }
-            config.osVersion?.let { put("os_version", it) }
+            config.appVersion?.let { put("app_version", it.take(VERSION_MAX_LENGTH)) }
+            config.osVersion?.let { put("os_version", it.take(VERSION_MAX_LENGTH)) }
         }.toString()
 
         val (status, payload) = transport.send(
-            "${config.baseUrl}/api/app/session", "POST", emptyMap(), body
+            "${config.apiBase}/api/app/session", "POST", emptyMap(), body
         )
 
         // 404 = uygulama bulunamadı VEYA mobil rıza modülü kapalı. Sunucu bu ikisini
@@ -175,10 +216,11 @@ class Veribenim(
     /** Sunucudaki beyanı çeker; sürüm değiştiyse `needsConsent()` yeniden true olur. */
     fun refresh(): String {
         val active = ensureSession()
-        val sessionParam = record?.sessionId?.let { "&session_id=$it" } ?: ""
+        val sessionParam = record?.sessionId
+            ?.let { "&session_id=" + java.net.URLEncoder.encode(it, "UTF-8") } ?: ""
 
         val (status, payload) = transport.send(
-            "${config.baseUrl}/api/preferences/${active.environmentToken}?platform=mobile$sessionParam",
+            "${config.apiBase}/api/preferences/${active.environmentToken}?platform=mobile$sessionParam",
             "GET", emptyMap(), null
         )
 
@@ -188,42 +230,81 @@ class Veribenim(
 
     // ── Offline kuyruk ───────────────────────────────────────────────────────
 
+    /** Rıza kaydı gövdesi — alanlar `ConsentController::log` doğrulamasıyla birebir. */
+    internal fun consentBody(entry: QueuedConsent): String = JSONObject().apply {
+        put("action", entry.action.key)
+        put("consents", JSONObject(entry.preferences.toPayload() as Map<*, *>))
+        put("session_id", entry.sessionId)
+        // `platform` GÖNDERİLMEZ: sunucu damgayı imzalı cihaz oturumundan okur.
+        // `user_agent` şart: sunucu boş değeri bot sayar (BotDetector: empty_ua).
+        put("user_agent", config.resolvedUserAgent)
+    }.toString()
+
+    /** @return HTTP durumu; ağ hatasında null. */
+    private fun sendConsent(active: DeviceSession, entry: QueuedConsent): Int? {
+        val body = consentBody(entry)
+        val headers = RequestSigner.headers(active, body, clock())
+        return try {
+            transport.send("${config.apiBase}/api/v/${active.environmentToken}/c", "POST", headers, body).first
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun dropSession() {
+        session = null
+        storage.clearSession()
+    }
+
     /**
      * Kuyruğu boşaltmayı dener. Ağ yoksa kayıtlar diskte kalır ve bir sonraki
      * açılışta yeniden denenir — rıza ispatı (KVKK Md.3) kaybolmaz.
+     *
+     * Kurallar dört SDK'da aynı (README → "Sunucu sözleşmesi"):
+     * - Sıra korunur: geçici hatada DURULUR. Sunucu aynı `session_id` satırını
+     *   günceller; "geri çek" ile "kabul" yer değiştirirse son durum ters yazılırdı.
+     * - 403 / 404 → oturum atılır, BİR KEZ yeniden el sıkışılır, aynı kayıt yeniden denenir.
+     * - 400 / 422 → kalıcı ret; kayıt kuyruğu tıkamasın diye atılır.
+     * - 402 (kota), 429, 5xx, ağ hatası → kayıt kuyrukta kalır.
      */
     fun flush() {
-        val queue = storage.loadQueue()
-        if (queue.isEmpty()) return
+        synchronized(flushLock) { drainOnce() }
+    }
 
-        val active = try { ensureSession() } catch (e: Exception) { return }
+    private fun drainOnce() {
+        val snapshot = synchronized(queueLock) { storage.loadQueue() }
+        if (snapshot.isEmpty()) return
 
-        val remaining = queue.filter { entry ->
-            val body = JSONObject().apply {
-                put("action", entry.action.key)
-                put("consents", JSONObject(entry.preferences.toPayload() as Map<*, *>))
-                put("session_id", entry.sessionId)
-                put("platform", "mobile")
-            }.toString()
+        var active = try { ensureSession() } catch (e: Exception) { return }
+        var handled = 0
+        var rehandshaken = false
 
-            val headers = RequestSigner.headers(active, body, clock())
+        loop@ for (entry in snapshot) {
+            var status = sendConsent(active, entry)
 
-            val failed = try {
-                val (status, _) = transport.send(
-                    "${config.baseUrl}/api/v/${active.environmentToken}/c", "POST", headers, body
-                )
-                // 403 → oturum düşmüş veya modül kapanmış; yeniden el sıkışılsın
-                // diye oturum atılır, kayıt kuyrukta kalır.
-                if (status == 403) { session = null; storage.clearSession() }
-                status != 200
-            } catch (e: Exception) {
-                true
+            if ((status == 403 || status == 404) && !rehandshaken) {
+                rehandshaken = true
+                dropSession()
+                active = try { ensureSession() } catch (e: Exception) { break@loop }
+                status = sendConsent(active, entry)
             }
 
-            failed
+            when {
+                status != null && status in 200..299 -> handled++
+                status == 400 || status == 422 -> handled++
+                else -> {
+                    if (status == 403) dropSession()
+                    break@loop
+                }
+            }
         }
 
-        storage.saveQueue(remaining)
+        // Tur sürerken eklenen kayıtlar kuyruğun SONUNDA durur; yalnızca bu
+        // turda işlenen baştaki kayıtlar çıkarılır.
+        synchronized(queueLock) {
+            val current = storage.loadQueue()
+            storage.saveQueue(current.drop(minOf(handled, current.size)))
+        }
     }
 
     private fun parseIso8601(value: String): Long? = runCatching {

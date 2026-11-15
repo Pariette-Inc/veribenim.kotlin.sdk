@@ -90,7 +90,7 @@ data class QueuedConsent(
 data class DeviceSession(
     val environmentToken: String,
     val deviceToken: String,
-    /** Paylaşılan sır. EncryptedSharedPreferences'ta yaşar, asla loglanmaz. */
+    /** Paylaşılan sır; asla loglanmaz. Nerede saklandığını [ConsentStorage] belirler. */
     val secret: String,
     val expiresAtMillis: Long,
 ) {
